@@ -40,22 +40,54 @@ function splitUrl(rawUrl: string): { path: string; query: string } {
   }
 }
 
+const EXPECTED_AUTH = TOKEN === '' ? '' : `Bearer ${TOKEN}`;
+
 function isAuthorized(req: IncomingMessage): boolean {
   const header = req.headers.authorization ?? '';
   if (TOKEN === '') return header.startsWith('Bearer ') && header.length > 7;
-  return header === `Bearer ${TOKEN}`;
+  return header === EXPECTED_AUTH;
 }
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer;
-    size += buffer.length;
-    if (size > MAX_BODY_BYTES) throw new Error('request body too large');
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks);
+/**
+ * Read a request body with plain 'data'/'end' listeners instead of `for await`
+ * over the stream. The async-iterator protocol (iterator object + a promise per
+ * chunk) costs several microseconds per POST; the bench sends ~1500 POSTs per
+ * trial, almost all single-chunk. Semantics are identical to the old version:
+ * resolves with the full body, rejects on oversize (handled as 413 upstream)
+ * or on stream error/abort.
+ */
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    const fail = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      req.destroy();
+      reject(err);
+    };
+    req.on('data', (chunk: Buffer) => {
+      if (settled) return;
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        fail(new Error('request body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks));
+    });
+    req.on('error', fail);
+    req.on('close', () => {
+      // Aborted mid-body: 'end' will never fire. A normally completed request
+      // has req.complete true (and 'end' already settled the promise).
+      if (!settled && !req.complete) fail(new Error('request aborted'));
+    });
+  });
 }
 
 function decodeSegments(path: string): string[] {

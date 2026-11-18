@@ -67,12 +67,19 @@ function headTip(repo: Repo): string | null {
 
 const AGENT = 'github-core-clone/1.0';
 
-function v2Advertisement(): Buffer {
+function buildV2Advertisement(): Buffer {
   const lines = ['version 2\n', `agent=${AGENT}\n`, 'ls-refs\n', 'fetch=shallow\n', 'object-format=sha1\n'];
   const parts = lines.map((line) => encodePktLine(line));
   parts.push(pktFlush());
   return Buffer.concat(parts);
 }
+
+/**
+ * The v2 advertisement is identical for every repo and every request (no ref
+ * data in it), so build it once and reuse the same bytes. sendBuffer never
+ * mutates the body, so sharing one Buffer across responses is safe.
+ */
+const V2_ADVERTISEMENT = buildV2Advertisement();
 
 function v0UploadAdvertisement(repo: Repo): Buffer {
   const caps = `side-band-64k thin-pack ofs-delta shallow multi_ack_detailed agent=${AGENT} symref=HEAD:refs/heads/${repo.defaultBranch}`;
@@ -114,7 +121,7 @@ export function handleInfoRefs(ctx: GitHttpContext, service: string): void {
   const { req, res, repo } = ctx;
   if (service === 'git-upload-pack') {
     if ((req.headers['git-protocol'] ?? '') === 'version=2') {
-      sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', v2Advertisement());
+      sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', V2_ADVERTISEMENT);
     } else {
       sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', v0UploadAdvertisement(repo));
     }
