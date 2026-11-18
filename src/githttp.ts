@@ -14,7 +14,6 @@ import {
   type PushCommand,
 } from './gitproto.ts';
 import {
-  hashObject,
   isObjectId,
   parseTag,
   VIEWER,
@@ -35,9 +34,9 @@ function sendBuffer(res: ServerResponse, status: number, contentType: string, bo
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text) });
-  res.end(text);
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length });
+  res.end(buf);
 }
 
 function sortedRefs(repo: Repo): Array<{ name: string; oid: string }> {
@@ -192,13 +191,45 @@ function sidebandPackets(pack: Buffer): Buffer[] {
   const chunkSize = PKT_LINE_MAX - 4 - 1; // pkt-line header + band byte
   for (let offset = 0; offset < pack.length; offset += chunkSize) {
     const chunk = pack.subarray(offset, Math.min(pack.length, offset + chunkSize));
-    const payload = Buffer.concat([Buffer.from([1]), chunk]);
-    out.push(encodePktLine(payload));
+    const line = Buffer.allocUnsafe(4 + 1 + chunk.length);
+    line.write((chunk.length + 5).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    line[4] = 1;
+    chunk.copy(line, 5);
+    out.push(line);
   }
   return out;
 }
 
+const FETCH_CACHE_MAX_ENTRIES = 8;
+const FETCH_CACHE_MAX_BYTES = 256 * 1024;
+
+/**
+ * Key for a memoized fetch response. The pack a fetch returns is fully determined by
+ * (protocol, wants, haves, depth, oldShallow) plus the object map — and objects are
+ * content-addressed and append-only, so the map's size is a sound generation counter:
+ * the same size means the same map (no deletes, same oid always means the same bytes).
+ * A hit is therefore byte-identical to a rebuild.
+ */
+function fetchCacheKey(repo: Repo, args: FetchArgs, version: 'v2' | 'v0'): string {
+  return `${version}|${repo.objects.size}|${JSON.stringify([args.wants, args.haves, args.depth, args.shallow])}`;
+}
+
+function storeFetchResponse(repo: Repo, key: string, response: Buffer): void {
+  if (response.length > FETCH_CACHE_MAX_BYTES) return;
+  const cache = repo.fetchCache;
+  if (cache.has(key)) return;
+  while (cache.size >= FETCH_CACHE_MAX_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+  cache.set(key, response);
+}
+
 function fetchResponse(repo: Repo, args: FetchArgs): Buffer {
+  const key = fetchCacheKey(repo, args, 'v2');
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo.objects, args.wants, args.haves, args.depth, args.shallow);
   const parts: Buffer[] = [];
   // Protocol v2: the acknowledgments section is sent only when the client sent
@@ -222,10 +253,15 @@ function fetchResponse(repo: Repo, args: FetchArgs): Buffer {
     parts.push(...sidebandPackets(pack));
   }
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  storeFetchResponse(repo, key, out);
+  return out;
 }
 
 function fetchResponseV0(repo: Repo, args: FetchArgs): Buffer {
+  const key = fetchCacheKey(repo, args, 'v0');
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo.objects, args.wants, args.haves, args.depth, args.shallow);
   const parts: Buffer[] = [];
   for (const oid of plan.shallow) parts.push(encodePktLine(`shallow ${oid}\n`));
@@ -236,7 +272,9 @@ function fetchResponseV0(repo: Repo, args: FetchArgs): Buffer {
     parts.push(...sidebandPackets(pack));
   }
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  storeFetchResponse(repo, key, out);
+  return out;
 }
 
 export function handleUploadPack(ctx: GitHttpContext, body: Buffer): void {
@@ -319,9 +357,9 @@ export function handleReceivePack(ctx: GitHttpContext, body: Buffer): void {
   if (packBytes.length > 0) {
     try {
       const { objects } = readPack(packBytes, (oid) => repo.objects.get(oid));
+      // readPack already keys every object by its recomputed id (a mismatch throws
+      // there), so re-hashing here can never fail; just store what is new.
       for (const [oid, object] of objects) {
-        const check = hashObject(object.type, object.data);
-        if (check !== oid) throw new Error(`object ${oid} does not recompute`);
         if (!repo.objects.has(oid)) repo.objects.set(oid, object);
       }
     } catch (err) {

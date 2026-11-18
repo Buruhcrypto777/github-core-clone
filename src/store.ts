@@ -44,7 +44,7 @@ export function isObjectId(value: string): boolean {
 export function hashObject(type: GitObjectType, data: Uint8Array): string {
   const body = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const hash = createHash('sha1');
-  hash.update(Buffer.from(`${type} ${body.length}\u0000`, 'utf8'));
+  hash.update(`${type} ${body.length}\u0000`, 'utf8');
   hash.update(body);
   return hash.digest('hex');
 }
@@ -434,6 +434,10 @@ export interface Repo {
   comments: Map<number, IssueComment[]>;
   commentSeq: number;
   commitSeq: number;
+  /** Serialized single-issue responses, keyed by issue number (see rest.ts issueJsonText). */
+  issueTextCache: Map<number, { key: string; text: string }>;
+  /** Memoized fetch (upload-pack) responses, keyed by fetchCacheKey (see githttp.ts). */
+  fetchCache: Map<string, Buffer>;
 }
 
 export class Store {
@@ -479,6 +483,8 @@ export class Store {
       comments: new Map(),
       commentSeq: 0,
       commitSeq: 0,
+      issueTextCache: new Map(),
+      fetchCache: new Map(),
     };
     this.repoIdSeq += 1;
     this.repos.set(this.key(VIEWER.login, name), repo);

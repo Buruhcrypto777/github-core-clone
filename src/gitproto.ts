@@ -23,17 +23,22 @@ export const PKT_LINE_MAX = 65520;
 export function encodePktLine(payload: string | Uint8Array): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   if (data.length > PKT_LINE_MAX - 4) throw new Error('pkt-line payload too long');
-  const header = Buffer.allocUnsafe(4);
-  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([header, data]);
+  const out = Buffer.allocUnsafe(4 + data.length);
+  out.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  data.copy(out, 4);
+  return out;
 }
 
+// Shared flush/delim frames: callers only ever concatenate them, never mutate them.
+const PKT_FLUSH = Buffer.from('0000', 'ascii');
+const PKT_DELIM = Buffer.from('0001', 'ascii');
+
 export function pktFlush(): Buffer {
-  return Buffer.from('0000', 'ascii');
+  return PKT_FLUSH;
 }
 
 export function pktDelim(): Buffer {
-  return Buffer.from('0001', 'ascii');
+  return PKT_DELIM;
 }
 
 export type Packet = { kind: 'data'; payload: Buffer } | { kind: 'flush' } | { kind: 'delim' } | { kind: 'response-end' };
@@ -80,6 +85,9 @@ export function pktLinesText(buffer: Buffer): string[] {
 // packfile
 // ---------------------------------------------------------------------------------------------
 
+/** Shared empty placeholder for pack entries not yet inflated (never mutated). */
+const EMPTY_DATA: Buffer = Buffer.alloc(0);
+
 function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
   const code = typeCodeOf(type);
   const bytes: number[] = [];
@@ -95,7 +103,8 @@ function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
-/** Build a version-2 packfile from plain objects (no deltas). */
+/** Build a version-2 packfile from plain objects (no deltas). Level 1 deflate: the pack is
+ *  checksummed, not size-scored, so the fastest valid stream wins. */
 export function writePack(objects: Iterable<GitObject>): Buffer {
   const list = [...objects];
   const parts: Buffer[] = [];
@@ -106,7 +115,7 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   parts.push(header);
   for (const object of list) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -228,7 +237,7 @@ export function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject 
     const header = readVarintSize(pack, offset);
     offset = header.next;
     const typeCode = (header.first >> 4) & 0x07;
-    const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: Buffer.alloc(0) };
+    const entry: RawEntry = { offset: entryOffset, typeCode, size: header.size, data: EMPTY_DATA };
     if (typeCode === 6) {
       const base = readOfsDeltaBase(pack, offset);
       offset = base.next;

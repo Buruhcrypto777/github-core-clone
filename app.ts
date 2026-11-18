@@ -16,16 +16,27 @@ const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 let requestCounter = 0;
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length, ...headers });
+  res.end(buf);
 }
 
-function pathOf(req: IncomingMessage): string {
+const EMPTY_BUFFER = Buffer.alloc(0);
+
+/** Split req.url into its raw path and query string without building a URL object. */
+function splitUrl(rawUrl: string): { path: string; query: string } {
+  const q = rawUrl.indexOf('?');
+  const rawPath = q < 0 ? rawUrl : rawUrl.slice(0, q);
+  const query = q < 0 ? '' : rawUrl.slice(q + 1);
+  // new URL() normalizes dot segments, duplicate slashes and %2e; the fast path below
+  // is byte-identical for the clean paths clients send, and anything odd falls back to it.
+  if (!rawPath.includes('/.') && !rawPath.includes('//') && !rawPath.includes('%2e') && !rawPath.includes('%2E')) {
+    return { path: rawPath === '' ? '/' : rawPath, query };
+  }
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    return { path: new URL(rawUrl, 'http://entry').pathname, query };
   } catch {
-    return '/';
+    return { path: '/', query };
   }
 }
 
@@ -49,6 +60,7 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
 
 function decodeSegments(path: string): string[] {
   return path.split('/').filter((segment) => segment !== '').map((segment) => {
+    if (!segment.includes('%')) return segment;
     try {
       return decodeURIComponent(segment);
     } catch {
@@ -71,28 +83,11 @@ export function createApp(): Server {
 }
 
 async function handleRequest(store: Store, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  // Every reply carries a non-empty X-GitHub-Request-Id.
+  // Every reply carries a non-empty X-GitHub-Request-Id (set once; writeHead sends it).
   const requestId = `req-${++requestCounter}`;
-  const origWriteHead = res.writeHead.bind(res);
-  res.writeHead = ((
-    statusCode: number,
-    statusMessageOrHeaders?: string | Record<string, string | number | string[]>,
-    maybeHeaders?: Record<string, string | number | string[]>,
-  ): ServerResponse => {
-    let headers: Record<string, string | number | string[]> = {};
-    let statusMessage: string | undefined;
-    if (typeof statusMessageOrHeaders === 'string') {
-      statusMessage = statusMessageOrHeaders;
-      headers = maybeHeaders ?? {};
-    } else {
-      headers = statusMessageOrHeaders ?? {};
-    }
-    headers['x-github-request-id'] = requestId;
-    if (statusMessage !== undefined) return origWriteHead(statusCode, statusMessage, headers);
-    return origWriteHead(statusCode, headers);
-  }) as typeof res.writeHead;
+  res.setHeader('x-github-request-id', requestId);
 
-  const path = pathOf(req);
+  const { path, query: queryString } = splitUrl(req.url ?? '/');
   const method = req.method ?? 'GET';
   const segments = decodeSegments(path);
   const origin = `http://${req.headers.host ?? '127.0.0.1'}`;
@@ -110,14 +105,23 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
   }
 
   // Read the body first (even for refusals) so keep-alive connections stay clean.
-  let body: Buffer;
-  try {
-    body = await readBody(req);
-  } catch {
-    sendJson(res, 413, { message: 'request body too large' });
-    return;
+  // Requests that cannot carry a body skip the stream machinery entirely; anything
+  // with a declared body is still read in full.
+  const contentLength = req.headers['content-length'];
+  const hasBody =
+    method === 'POST' || method === 'PUT' || method === 'PATCH' ||
+    (contentLength !== undefined && contentLength !== '0') ||
+    req.headers['transfer-encoding'] !== undefined;
+  let body: Buffer = EMPTY_BUFFER;
+  if (hasBody) {
+    try {
+      body = await readBody(req);
+    } catch {
+      sendJson(res, 413, { message: 'request body too large' });
+      return;
+    }
   }
-  const query = new URL(req.url ?? '/', 'http://entry').searchParams;
+  const query = new URLSearchParams(queryString);
 
   // MCP close: DELETE /mcp (best-effort, no session is kept).
   if (path === '/mcp' && method === 'DELETE') {

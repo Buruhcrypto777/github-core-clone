@@ -88,8 +88,17 @@ export function repoJson(ctx: RestContext, repo: Repo): Record<string, unknown> 
   };
 }
 
+const VIEWER_USER_JSON: Record<string, unknown> = {
+  login: VIEWER.login,
+  id: VIEWER.id,
+  node_id: globalId('User', VIEWER.id),
+  type: 'User',
+  site_admin: false,
+};
+
+/** The viewer never changes, so one shared object is returned (serialization only). */
 function userJson(): Record<string, unknown> {
-  return { login: VIEWER.login, id: VIEWER.id, node_id: globalId('User', VIEWER.id), type: 'User', site_admin: false };
+  return VIEWER_USER_JSON;
 }
 
 function labelJson(label: Label): Record<string, unknown> {
@@ -123,6 +132,43 @@ export function issueJson(ctx: RestContext, repo: Repo, issue: Issue): Record<st
     closed_at: issue.state === 'closed' ? FIXED_TS : null,
     author_association: 'OWNER',
   };
+}
+
+/**
+ * Fingerprint of everything issueJson renders for one issue. Any mutation that could
+ * change the rendered bytes (issue fields, label color/description, comment count,
+ * repo name, origin) changes the fingerprint, so a cache hit is always byte-identical
+ * to a rebuild — no invalidation bookkeeping, and mutations through MCP or GraphQL
+ * cannot stale it either.
+ */
+function issueFingerprint(ctx: RestContext, repo: Repo, issue: Issue): string {
+  const labelParts: string[] = [];
+  for (const name of issue.labels) {
+    const label = repo.labels.get(name);
+    labelParts.push(label ? `${name}=${label.color}=${label.description}` : `${name}=`);
+  }
+  const comments = repo.comments.get(issue.number)?.length ?? 0;
+  return JSON.stringify([
+    repo.id, repo.name, ctx.origin, issue.id, issue.number, issue.title, issue.body,
+    issue.state, labelParts.join('|'), comments,
+  ]);
+}
+
+/** The serialized single-issue response, memoized per fingerprint. */
+function issueJsonText(ctx: RestContext, repo: Repo, issue: Issue): string {
+  const cached = repo.issueTextCache.get(issue.number);
+  const key = issueFingerprint(ctx, repo, issue);
+  if (cached !== undefined && cached.key === key) return cached.text;
+  const text = `${JSON.stringify(issueJson(ctx, repo, issue))}\n`;
+  repo.issueTextCache.set(issue.number, { key, text });
+  return text;
+}
+
+/** Send an already-serialized JSON body. */
+function jsonText(ctx: RestContext, status: number, text: string, extraHeaders: Record<string, string> = {}): void {
+  const buf = Buffer.from(text, 'utf8');
+  ctx.res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length, ...extraHeaders });
+  ctx.res.end(buf);
 }
 
 function refJson(repo: Repo, branch: string, sha: string): Record<string, unknown> {
@@ -343,9 +389,9 @@ export function deleteFile(repo: Repo, branch: string, path: string, message: st
 type Handler = (ctx: RestContext, params: Record<string, string>, body: unknown) => void;
 
 function json(ctx: RestContext, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  ctx.res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text), ...extraHeaders });
-  ctx.res.end(text);
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  ctx.res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length, ...extraHeaders });
+  ctx.res.end(buf);
 }
 
 function err(ctx: RestContext, status: number, message: string): void {
@@ -797,7 +843,7 @@ route('GET', '/repos/([^/]+)/([^/]+)/issues/(\\d+)', (ctx, params) => {
   if (!repo) return notFound(ctx);
   const issue = repo.issues.get(Number(params.number));
   if (!issue) return notFound(ctx);
-  json(ctx, 200, issueJson(ctx, repo, issue));
+  jsonText(ctx, 200, issueJsonText(ctx, repo, issue));
 });
 
 // PATCH /api/v3/repos/{o}/{r}/issues/{n}
